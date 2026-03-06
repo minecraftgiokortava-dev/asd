@@ -21,6 +21,7 @@ const SELF_PING_INTERVAL_MS = 10 * 60 * 1000;
 
 const COOLDOWN_SECONDS = Number(process.env.COOLDOWN_SECONDS || 8);
 const SESSION_TTL_HOURS = Number(process.env.SESSION_TTL_HOURS || 72);
+const PASSWORD_MIN_LENGTH = Number(process.env.PASSWORD_MIN_LENGTH || 6);
 
 const TILE_COUNT = 2048;
 const TILE_SIZE = 1000;
@@ -178,6 +179,11 @@ function normalizeName(name) {
   return name.trim().replace(/\s+/g, ' ').slice(0, MAX_NAME_LENGTH);
 }
 
+function normalizePassword(password) {
+  if (typeof password !== 'string') return '';
+  return password;
+}
+
 function getAuthToken(req) {
   const auth = req.headers.authorization || '';
   const match = auth.match(/^Bearer\s+(.+)$/i);
@@ -232,19 +238,62 @@ function getSession(req) {
 }
 
 function createSession(name) {
-  const userId = crypto.randomUUID();
+  const user = getUserByName(name);
+  if (!user) return null;
+  return createSessionForUser(user);
+}
+
+function createSessionForUser(user) {
   const token = crypto.randomBytes(32).toString('hex');
   const now = Date.now();
   const expiresAt = now + SESSION_TTL_HOURS * 60 * 60 * 1000;
-  state.users[userId] = { userId, name, createdAt: now };
-  state.sessions[token] = { token, userId, createdAt: now, expiresAt };
+  state.sessions[token] = { token, userId: user.userId, createdAt: now, expiresAt };
   persistStateSoon();
-  return { token, userId, name, expiresAt };
+  return { token, userId: user.userId, name: user.name, expiresAt };
+}
+
+function hashPassword(password, saltHex) {
+  return crypto.scryptSync(password, saltHex, 64).toString('hex');
+}
+
+function findUserByNameInsensitive(name) {
+  const target = String(name || '').toLowerCase();
+  for (const user of Object.values(state.users)) {
+    if (String(user.name || '').toLowerCase() === target) {
+      return user;
+    }
+  }
+  return null;
+}
+
+function getUserByName(name) {
+  return findUserByNameInsensitive(name);
+}
+
+function createUser(name, password) {
+  const userId = crypto.randomUUID();
+  const now = Date.now();
+  const passwordSalt = crypto.randomBytes(16).toString('hex');
+  const passwordHash = hashPassword(password, passwordSalt);
+  const user = { userId, name, passwordSalt, passwordHash, createdAt: now };
+  state.users[userId] = user;
+  persistStateSoon();
+  return user;
+}
+
+function verifyUserPassword(user, password) {
+  if (!user?.passwordSalt || !user?.passwordHash) {
+    return false;
+  }
+  const calculated = hashPassword(password, user.passwordSalt);
+  const expected = Buffer.from(user.passwordHash, 'hex');
+  const actual = Buffer.from(calculated, 'hex');
+  if (expected.length !== actual.length) return false;
+  return crypto.timingSafeEqual(expected, actual);
 }
 
 function isUsernameTaken(name) {
-  const target = String(name || '').toLowerCase();
-  return Object.values(state.users).some((user) => String(user.name || '').toLowerCase() === target);
+  return Boolean(findUserByNameInsensitive(name));
 }
 
 function isValidTileCoord(value) {
@@ -357,22 +406,61 @@ async function routeApi(req, res, urlObj) {
     return true;
   }
 
-  if (req.method === 'POST' && urlObj.pathname === '/api/session') {
+  if (req.method === 'POST' && (urlObj.pathname === '/api/register' || urlObj.pathname === '/api/session')) {
     const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
     if (body.__error) {
       sendJson(res, 400, { error: body.__error });
       return true;
     }
     const name = normalizeName(body.name);
+    const password = normalizePassword(body.password);
     if (!name || name.length < 2) {
       sendJson(res, 400, { error: 'Name must be at least 2 characters.' });
+      return true;
+    }
+    if (!password || password.length < PASSWORD_MIN_LENGTH) {
+      sendJson(res, 400, { error: `Password must be at least ${PASSWORD_MIN_LENGTH} characters.` });
       return true;
     }
     if (isUsernameTaken(name)) {
       sendJson(res, 409, { error: 'Username already taken.' });
       return true;
     }
-    sendJson(res, 201, createSession(name));
+    const user = createUser(name, password);
+    sendJson(res, 201, createSessionForUser(user));
+    return true;
+  }
+
+  if (req.method === 'POST' && urlObj.pathname === '/api/login') {
+    const body = await readJsonBody(req).catch((err) => ({ __error: err.message }));
+    if (body.__error) {
+      sendJson(res, 400, { error: body.__error });
+      return true;
+    }
+    const name = normalizeName(body.name);
+    const password = normalizePassword(body.password);
+    if (!name || !password) {
+      sendJson(res, 400, { error: 'Name and password are required.' });
+      return true;
+    }
+
+    const user = findUserByNameInsensitive(name);
+    if (!user || !verifyUserPassword(user, password)) {
+      sendJson(res, 401, { error: 'Invalid username or password.' });
+      return true;
+    }
+
+    sendJson(res, 200, createSessionForUser(user));
+    return true;
+  }
+
+  if (req.method === 'POST' && urlObj.pathname === '/api/logout') {
+    const token = getAuthToken(req);
+    if (token && state.sessions[token]) {
+      delete state.sessions[token];
+      persistStateSoon();
+    }
+    sendJson(res, 200, { ok: true });
     return true;
   }
 
