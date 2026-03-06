@@ -161,6 +161,11 @@ function createSession(name) {
   return { token, userId, name, expiresAt };
 }
 
+function isUsernameTaken(name) {
+  const target = String(name || '').toLowerCase();
+  return Object.values(state.users).some((user) => String(user.name || '').toLowerCase() === target);
+}
+
 function isValidTileCoord(value) {
   return Number.isInteger(value) && value >= 0 && value < TILE_COUNT;
 }
@@ -282,7 +287,30 @@ async function routeApi(req, res, urlObj) {
       sendJson(res, 400, { error: 'Name must be at least 2 characters.' });
       return true;
     }
+    if (isUsernameTaken(name)) {
+      sendJson(res, 409, { error: 'Username already taken.' });
+      return true;
+    }
     sendJson(res, 201, createSession(name));
+    return true;
+  }
+
+  if (req.method === 'GET' && urlObj.pathname === '/api/pixel-info') {
+    const tileX = Number.parseInt(urlObj.searchParams.get('tileX') || '', 10);
+    const tileY = Number.parseInt(urlObj.searchParams.get('tileY') || '', 10);
+    const x = Number.parseInt(urlObj.searchParams.get('x') || '', 10);
+    const y = Number.parseInt(urlObj.searchParams.get('y') || '', 10);
+    if (!isValidTileCoord(tileX) || !isValidTileCoord(tileY) || !isValidPixelCoord(x) || !isValidPixelCoord(y)) {
+      sendJson(res, 400, { error: 'Invalid tile/pixel coordinates.' });
+      return true;
+    }
+    const key = pixelKey(tileX, tileY, x, y);
+    const pixel = state.pixels[key];
+    if (!pixel) {
+      sendJson(res, 404, { error: 'Pixel not painted yet.' });
+      return true;
+    }
+    sendJson(res, 200, { pixel });
     return true;
   }
 
