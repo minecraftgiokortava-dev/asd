@@ -3,10 +3,17 @@ const path = require('path');
 const http = require('http');
 const crypto = require('crypto');
 const { URL } = require('url');
+let PgPool = null;
+try {
+  PgPool = require('pg').Pool;
+} catch (_err) {
+  // Optional: fallback to file storage if pg is unavailable.
+}
 
 const PORT = Number(process.env.PORT || 3000);
 const DATA_PATH = path.join(__dirname, 'data.json');
 const PUBLIC_DIR = path.join(__dirname, 'public');
+const DATABASE_URL = process.env.DATABASE_URL || '';
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
 const SELF_PING_URL = (process.env.SELF_PING_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
 const SELF_PING_ENABLED = String(process.env.SELF_PING_ENABLED || 'true').toLowerCase() === 'true';
@@ -39,34 +46,108 @@ function createDefaultState() {
   };
 }
 
-function loadState() {
+function sanitizeState(parsed) {
+  if (!parsed || typeof parsed !== 'object') {
+    return createDefaultState();
+  }
+  return {
+    users: parsed.users || {},
+    sessions: parsed.sessions || {},
+    pixels: parsed.pixels || {},
+    lastPlacementByUser: parsed.lastPlacementByUser || {}
+  };
+}
+
+function loadStateFromFile() {
   try {
     const raw = fs.readFileSync(DATA_PATH, 'utf8');
-    const parsed = JSON.parse(raw);
-    return {
-      users: parsed.users || {},
-      sessions: parsed.sessions || {},
-      pixels: parsed.pixels || {},
-      lastPlacementByUser: parsed.lastPlacementByUser || {}
-    };
+    return sanitizeState(JSON.parse(raw));
   } catch (_err) {
     return createDefaultState();
   }
 }
 
-const state = loadState();
+const state = createDefaultState();
+Object.assign(state, loadStateFromFile());
+
+let dbPool = null;
+let usingPostgres = false;
 let saveTimer = null;
 const sseClients = new Set();
 
 function persistStateSoon() {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
+  saveTimer = setTimeout(async () => {
+    if (usingPostgres && dbPool) {
+      try {
+        await dbPool.query(
+          `INSERT INTO app_state (id, data, updated_at)
+           VALUES (1, $1::jsonb, NOW())
+           ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
+          [JSON.stringify(state)]
+        );
+      } catch (err) {
+        console.error('Failed to save state to postgres:', err.message);
+      }
+      return;
+    }
+
     fs.writeFile(DATA_PATH, JSON.stringify(state), (err) => {
       if (err) {
         console.error('Failed to save data.json:', err.message);
       }
     });
   }, 150);
+}
+
+async function initStorage() {
+  if (!DATABASE_URL || !PgPool) {
+    console.log('Storage mode: file (data.json)');
+    return;
+  }
+
+  try {
+    dbPool = new PgPool({
+      connectionString: DATABASE_URL,
+      ssl: process.env.PGSSLMODE === 'disable' ? false : undefined
+    });
+
+    await dbPool.query(`
+      CREATE TABLE IF NOT EXISTS app_state (
+        id SMALLINT PRIMARY KEY,
+        data JSONB NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
+    const result = await dbPool.query('SELECT data FROM app_state WHERE id = 1');
+    if (result.rows.length > 0 && result.rows[0].data) {
+      Object.assign(state, sanitizeState(result.rows[0].data));
+      console.log('Loaded state from postgres.');
+    } else {
+      await dbPool.query(
+        `INSERT INTO app_state (id, data, updated_at) VALUES (1, $1::jsonb, NOW())
+         ON CONFLICT (id) DO NOTHING`,
+        [JSON.stringify(state)]
+      );
+      console.log('Initialized postgres state from current memory state.');
+    }
+
+    usingPostgres = true;
+    console.log('Storage mode: postgres');
+  } catch (err) {
+    console.error('Postgres init failed, falling back to file storage:', err.message);
+    usingPostgres = false;
+    if (dbPool) {
+      try {
+        await dbPool.end();
+      } catch (_ignore) {
+        // no-op
+      }
+      dbPool = null;
+    }
+    console.log('Storage mode: file (data.json)');
+  }
 }
 
 function sendJson(res, statusCode, payload) {
@@ -435,21 +516,30 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`Server running: http://localhost:${PORT}`);
-  console.log('Run command: node server.js');
-  if (SELF_PING_ENABLED && SELF_PING_URL) {
-    const target = `${SELF_PING_URL}/healthz`;
-    setInterval(async () => {
-      try {
-        const response = await fetch(target, { method: 'GET' });
-        if (!response.ok) {
-          console.warn(`Self ping failed: ${response.status} ${response.statusText}`);
+async function start() {
+  await initStorage();
+
+  server.listen(PORT, () => {
+    console.log(`Server running: http://localhost:${PORT}`);
+    console.log('Run command: node server.js');
+    if (SELF_PING_ENABLED && SELF_PING_URL) {
+      const target = `${SELF_PING_URL}/healthz`;
+      setInterval(async () => {
+        try {
+          const response = await fetch(target, { method: 'GET' });
+          if (!response.ok) {
+            console.warn(`Self ping failed: ${response.status} ${response.statusText}`);
+          }
+        } catch (err) {
+          console.warn(`Self ping error: ${err.message}`);
         }
-      } catch (err) {
-        console.warn(`Self ping error: ${err.message}`);
-      }
-    }, SELF_PING_INTERVAL_MS).unref();
-    console.log(`Self ping enabled every 10m -> ${target}`);
-  }
+      }, SELF_PING_INTERVAL_MS).unref();
+      console.log(`Self ping enabled every 10m -> ${target}`);
+    }
+  });
+}
+
+start().catch((err) => {
+  console.error('Failed to start server:', err.message);
+  process.exit(1);
 });
